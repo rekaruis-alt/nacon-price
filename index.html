@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>기프티콘 구매 판단</title>
+<style>
+  :root { --line:#d0d7de; --ok:#1a7f37; --no:#cf222e; --mid:#9a6700; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "Malgun Gothic", sans-serif; margin: 0; padding: 12px; color:#1f2328; max-width: 560px; }
+  h1 { font-size: 16px; margin: 0 0 6px; }
+  .note { font-size: 12px; color:#57606a; margin-bottom: 10px; line-height: 1.5; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+  .card input { width: 100%; padding: 8px 8px; font-size: 16px; border: 1px solid var(--line); border-radius: 6px; }
+  .pair { display: flex; gap: 8px; margin-top: 8px; }
+  .col { flex: 1; min-width: 0; }
+  .col input { text-align: right; }
+  .sub { font-size: 11px; color:#8c959f; margin-top: 3px; text-align: right; min-height: 14px; }
+  .band { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); text-align: center; font-size: 12px; }
+  .verdict { font-weight: 700; }
+  .buy-yes { color: var(--ok); } .buy-no { color: var(--no); } .buy-mid { color: var(--mid); }
+  .btns { margin: 8px 0; display: flex; gap: 8px; }
+  button { padding: 10px 16px; font-size: 14px; cursor: pointer; }
+  button.primary { background: #1f6feb; color: #fff; border: 0; border-radius: 6px; }
+  svg { width: 100%; max-width: 420px; height: auto; }
+  svg text { font-family: system-ui, "Malgun Gothic", sans-serif; }
+  .qty-sub { font-size: 12px; color:#57606a; margin-top: 2px; }
+  .meta { font-size: 11px; color:#8c959f; margin-top: 3px; }
+  #status { font-size: 11px; color:#57606a; margin-top: 6px; line-height: 1.4; }
+</style>
+</head>
+<body>
+<h1>기프티콘 구매 판단</h1>
+<div class="note">
+  상품명·구매가를 입력하면 아래에 판매대기 밴드와 판정이 나옵니다. 판매가는 손익분기 판매가로 채워지고 직접 바꿔 볼 수 있습니다.<br>
+  <span style="color:#e57373">빨간 세로선 = 판매가</span>, <span style="color:#9d86e8">보라 점선 = 손익분기(구매가 환산)</span>. 가격은 수수료 전 판매가 기준, 상품명은 <b>+</b>로 구성품을 이어서 입력(순서 무관).
+</div>
+
+<div id="rows"></div>
+
+<div class="btns">
+  <button id="addRow">행 추가</button>
+  <button id="run" class="primary">실행</button>
+</div>
+<div id="status">데이터 불러오는 중…</div>
+<datalist id="names"></datalist>
+
+<script>
+let DATA = null;   // { meta, items:[{n,b,id,nc,fee,fs,c,ap,ms,o:[[price,qty]]}] }
+let INDEX = [];    // 검색용: { it, norm, plus, key }
+
+const norm = s => String(s).replace(/\s+/g, "");
+const fmt = v => (v === "" || v == null || isNaN(v)) ? "" : Number(v).toLocaleString();
+const digitsOf = s => parseInt(String(s).replace(/[^0-9]/g, ""), 10);
+
+// 정산금액 = 판매가 − floor(판매가 × 수수료율)
+function settle(price, feePct) { return price - Math.floor(price * feePct / 100); }
+
+// 정산금액이 구매가 이상이 되는 가장 낮은 판매가 (손익분기, 수수료 전 가격)
+function breakEven(buy, feePct) {
+  let p = Math.max(0, Math.floor(buy / (1 - feePct / 100)) - 5);
+  while (settle(p, feePct) < buy) p++;
+  return p;
+}
+
+// 판정: 손익분기 판매가와 밴드(수수료 전 판매가) 비교
+function judge(be, lo, hi) {
+  if (be > hi) return ["구매 불필요", "buy-no"];
+  if (be <= lo) return ["무조건 구매", "buy-yes"];
+  return ["중간: 판단 필요", "buy-mid"];
+}
+
+// ---- 상품명 매칭 (계획 문서 규칙 + 오탐 완화) ----
+// 1) 공백 제거 후 완전 일치 우선
+// 2) 구성품을 '+'로 나눠 정렬했을 때 같은 상품 (순서만 다른 같은 구성, 구성품은 정확히 일치)
+// 3) 아니면 입력을 '+'로 나눈 키워드가 모두 포함되고, 구성 개수('+' 개수 + 1)가 같은 상품
+// 후보가 여러 개면 판매대기 수량이 많은 상품을 먼저 쓴다.
+const keyOf = s => String(s).split("+").map(norm).filter(Boolean).sort().join("+");
+function buildIndex(items) {
+  return items.map(it => ({ it, norm: norm(it.n), plus: it.n.split("+").length, key: keyOf(it.n) }));
+}
+function findItem(q) {
+  const nq = norm(q);
+  if (!nq) return { item: null, cands: [] };
+  let cands = INDEX.filter(x => x.norm === nq);
+  if (!cands.length) cands = INDEX.filter(x => x.key === keyOf(q));
+  if (!cands.length) {
+    const kws = String(q).split("+").map(norm).filter(Boolean);
+    if (kws.length) cands = INDEX.filter(x => x.plus === kws.length && kws.every(k => x.norm.includes(k)));
+  }
+  cands = cands.slice().sort((a, b) => b.it.c - a.it.c);
+  return { item: cands[0] ? cands[0].it : null, cands };
+}
+
+function suggest(q) {
+  const nq = norm(q);
+  if (nq.length < 2) return [];
+  return INDEX.filter(x => x.norm.includes(nq))
+    .sort((a, b) => b.it.c - a.it.c).slice(0, 15).map(x => x.it.n);
+}
+
+function compute(item, buy) {
+  if (!item || !buy) return null;
+  const opts = item.o;
+  if (!opts.length) return { empty: true };
+  const prices = opts.map(o => o[0]);
+  const lo = Math.min(...prices), hi = Math.max(...prices);
+  const total = opts.reduce((s, o) => s + o[1], 0);
+  const be = breakEven(buy, item.fee);
+  const below = opts.filter(o => o[0] <= be).reduce((s, o) => s + o[1], 0);
+  return { lo, hi, options: opts, verdict: judge(be, lo, hi), be, below, total };
+}
+
+// 밴드 분포 SVG: 왼쪽 끝 최저가, 오른쪽 끝 최고가, 점 크기 = 수량.
+// 판매가(빨강), 손익분기(보라 점선)는 밴드 밖이면 좌우 끝에 붙여 표시한다.
+function bandSvg(c, sale) {
+  const W = 260, H = 60, X0 = 14, X1 = W - 14, yLine = 34;
+  const span = c.hi - c.lo;
+  const inside = p => span === 0 ? W / 2 : X0 + (p - c.lo) / span * (X1 - X0);
+  const xAt = p => p < c.lo ? 4 : (p > c.hi ? W - 4 : inside(p));
+  const label = (x, y, txt, color) => {
+    const anchor = x <= 4 ? "start" : (x >= W - 4 ? "end" : "middle");
+    const tx = x <= 4 ? 2 : (x >= W - 4 ? W - 2 : x);
+    return `<text x="${tx}" y="${y}" font-size="9" text-anchor="${anchor}" fill="${color}">${txt}</text>`;
+  };
+  const parts = [];
+  parts.push(`<text x="0" y="10" font-size="10" text-anchor="start" fill="#8c959f">${fmt(c.lo)}</text>`);
+  parts.push(`<text x="${W}" y="10" font-size="10" text-anchor="end" fill="#8c959f">${fmt(c.hi)}</text>`);
+  parts.push(`<line x1="${X0}" y1="${yLine}" x2="${X1}" y2="${yLine}" stroke="#e6eaef" stroke-width="3" stroke-linecap="round"/>`);
+  if (sale > 0) {
+    const xs = xAt(sale);
+    parts.push(`<line x1="${xs}" y1="16" x2="${xs}" y2="${yLine + 12}" stroke="#e57373" stroke-width="2"/>`);
+    parts.push(label(xs, H - 2, `판매 ${fmt(sale)}`, "#e57373"));
+  }
+  const xBe = xAt(c.be);
+  parts.push(`<line x1="${xBe}" y1="16" x2="${xBe}" y2="${yLine + 12}" stroke="#9d86e8" stroke-width="1.5" stroke-dasharray="3 2"/>`);
+  parts.push(label(xBe, 26, `손익 ${fmt(c.be)}`, "#9d86e8"));
+  for (const [p, q] of c.options) {
+    const r = Math.min(8, 2.5 + 1.5 * Math.sqrt(q));
+    parts.push(`<circle cx="${inside(p)}" cy="${yLine}" r="${r}" fill="#a9cdf7" fill-opacity="0.6" stroke="#8fbff0"><title>${fmt(p)}원 · ${q}개</title></circle>`);
+  }
+  return `<svg viewBox="0 0 ${W} ${H}">${parts.join("")}</svg>`;
+}
+
+function setDefaultSale(card) {
+  const buy = digitsOf(card.querySelector("input.buy").value);
+  const { item } = findItem(card.querySelector("input.nm").value);
+  card.querySelector("input.sale").value = (item && buy) ? fmt(breakEven(buy, item.fee)) : "";
+}
+
+function addRow(name = "", buy = "") {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <input type="text" class="nm" list="names" placeholder="상품명 (예: 패밀리 아이스크림)" value="${name}">
+    <div class="pair">
+      <div class="col">
+        <input type="text" inputmode="numeric" class="buy" placeholder="구매가" value="${fmt(buy)}">
+        <div class="sub be"></div>
+      </div>
+      <div class="col">
+        <input type="text" inputmode="numeric" class="sale" placeholder="판매가" value="">
+        <div class="sub settle"></div>
+      </div>
+    </div>
+    <div class="band">-</div>`;
+  document.getElementById("rows").appendChild(card);
+
+  const nm = card.querySelector("input.nm");
+  const buyEl = card.querySelector("input.buy");
+  const saleEl = card.querySelector("input.sale");
+  card.dataset.saleTouched = "0";
+
+  nm.addEventListener("input", () => {
+    document.getElementById("names").innerHTML = suggest(nm.value).map(n => `<option value="${n.replace(/"/g, "&quot;")}">`).join("");
+    if (card.dataset.saleTouched !== "1") setDefaultSale(card);
+    calcRow(card);
+  });
+  buyEl.addEventListener("input", () => {
+    const d = digitsOf(buyEl.value);
+    buyEl.value = isNaN(d) ? "" : d.toLocaleString();
+    if (card.dataset.saleTouched !== "1") setDefaultSale(card);
+    calcRow(card);
+  });
+  saleEl.addEventListener("input", () => {
+    const d = digitsOf(saleEl.value);
+    saleEl.value = isNaN(d) ? "" : d.toLocaleString();
+    card.dataset.saleTouched = "1";
+    calcRow(card);
+  });
+  return card;
+}
+
+function calcRow(card) {
+  const q = card.querySelector("input.nm").value;
+  const buy = digitsOf(card.querySelector("input.buy").value);
+  const sale = digitsOf(card.querySelector("input.sale").value);
+  const { item, cands } = findItem(q);
+  const beEl = card.querySelector(".be");
+  const settleEl = card.querySelector(".settle");
+  const band = card.querySelector(".band");
+
+  if (!DATA) { band.textContent = "데이터 불러오는 중…"; return; }
+  if (!norm(q)) { band.textContent = "-"; beEl.textContent = ""; settleEl.textContent = ""; return; }
+  if (!item) {
+    band.innerHTML = `<span class="verdict">상품을 찾을 수 없음</span><div class="meta">상품명을 확인하세요 (후보가 입력창 아래에 뜹니다)</div>`;
+    beEl.textContent = ""; settleEl.textContent = ""; return;
+  }
+
+  const star = item.fs === "d" ? "*" : "";
+  settleEl.textContent = (sale > 0) ? `판매 정산 ${fmt(settle(sale, item.fee))}${star}` : "";
+
+  const meta = `${item.b} · ${item.n !== q.trim() ? "→ " + item.n + " · " : ""}수수료 ${item.fee}%${star}` +
+               (cands.length > 1 ? ` · 후보 ${cands.length}개` : "");
+  const c = compute(item, buy);
+
+  if (!buy) {
+    beEl.textContent = "";
+    band.innerHTML = `<div class="qty-sub">구매가를 입력하세요</div><div class="meta">${meta}</div>`;
+    return;
+  }
+  beEl.textContent = `손익분기 ${fmt(breakEven(buy, item.fee))}`;
+  if (c && c.empty) {
+    // 판매대기(셀러 쿠폰 옵션)가 없을 때: 판매 화면에 표시되는 값(예상가, 정산 최대)을 함께 보여 준다.
+    const extra = [];
+    if (item.ap) extra.push(`예상가 ${fmt(item.ap)}`);
+    if (item.ms) extra.push(`정산 최대 ${fmt(item.ms)}`);
+    band.innerHTML = `<span class="verdict">판매대기 없음</span>` +
+      (extra.length ? `<div class="qty-sub">판매 화면 표시값: ${extra.join(" · ")}</div>` : "") +
+      `<div class="meta">${meta}${item.c > 0 ? " · 재고는 있으나 옵션 없음" : ""}</div>`;
+    return;
+  }
+  const pct = c.total ? (c.below / c.total * 100).toFixed(1) : "-";
+  band.innerHTML = bandSvg(c, sale) +
+    `<div class="qty-sub">판매물량 ${c.below} / ${c.total} (${pct}%) · <span class="verdict ${c.verdict[1]}">${c.verdict[0]}</span></div>` +
+    `<div class="meta">${meta}</div>`;
+}
+
+function runAll() { document.querySelectorAll("#rows .card").forEach(calcRow); }
+
+document.getElementById("addRow").addEventListener("click", () => addRow());
+document.getElementById("run").addEventListener("click", runAll);
+addRow();
+
+fetch("products.json?v=" + Date.now())
+  .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+  .then(d => {
+    DATA = d;
+    INDEX = buildIndex(d.items);
+    const m = d.meta;
+    document.getElementById("status").textContent =
+      `상품 ${d.items.length.toLocaleString()}개 · 데이터 생성 ${m.generated}` +
+      (m.latestOptionsFetch ? ` · 옵션 수집 ${m.latestOptionsFetch}` : "") +
+      ` · *는 수수료율 기본값(7%) 적용`;
+    runAll();
+  })
+  .catch(e => { document.getElementById("status").textContent = "데이터를 불러오지 못했습니다: " + e.message; });
+</script>
+</body>
+</html>
