@@ -27,13 +27,21 @@
   .qty-sub { font-size: 12px; color:#57606a; margin-top: 2px; }
   .meta { font-size: 11px; color:#8c959f; margin-top: 3px; }
   #status { font-size: 11px; color:#57606a; margin-top: 6px; line-height: 1.4; }
+  .cands { margin-top: 6px; max-height: 240px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; }
+  .cands:empty { display: none; }
+  .cand { padding: 7px 8px; border-bottom: 1px solid #eef1f4; cursor: pointer; font-size: 13px; }
+  .cand:last-child { border-bottom: 0; }
+  .cand:hover, .cand:active { background: #f6f8fa; }
+  .cand span { display: block; font-size: 11px; color: #57606a; margin-top: 2px; }
+  .cand-empty { padding: 8px; font-size: 12px; color: #8c959f; line-height: 1.5; }
 </style>
 </head>
 <body>
 <h1>기프티콘 구매 판단</h1>
 <div class="note">
   상품명·구매가를 입력하면 아래에 판매대기 밴드와 판정이 나옵니다. 판매가는 손익분기 판매가로 채워지고 직접 바꿔 볼 수 있습니다.<br>
-  <span style="color:#e57373">빨간 세로선 = 판매가</span>, <span style="color:#9d86e8">보라 점선 = 손익분기(구매가 환산)</span>. 가격은 수수료 전 판매가 기준, 상품명은 <b>+</b>로 구성품을 이어서 입력(순서 무관).
+  <span style="color:#e57373">빨간 세로선 = 판매가</span>, <span style="color:#9d86e8">보라 점선 = 손익분기(구매가 환산)</span>. 가격은 수수료 전 판매가 기준, 상품명은 <b>+</b>로 구성품을 이어서 입력(순서 무관).<br>
+  상품명이 정확하지 않아도 됩니다. <b>투썸 만원</b>, <b>뚜레 2만원</b>, <b>샐러드</b>처럼 브랜드·금액·일부 단어를 넣고 <b>검색</b>(또는 상품명 칸에서 Enter)을 누르면 후보 목록이 뜨고, 고르면 그 상품으로 계산됩니다.
 </div>
 
 <div id="rows"></div>
@@ -42,16 +50,22 @@
   <button id="addRow">행 추가</button>
   <button id="run" class="primary">실행</button>
 </div>
+<div class="btns">
+  <button id="search">검색</button>
+</div>
 <div id="status">데이터 불러오는 중…</div>
-<datalist id="names"></datalist>
 
 <script>
 let DATA = null;   // { meta, items:[{n,b,id,nc,fee,fs,c,ap,ms,o:[[price,qty]]}] }
-let INDEX = [];    // 검색용: { it, norm, plus, key }
+let INDEX = [];    // 검색용: { it, norm, plus, key, nameN, brandN, amt }
+let BRANDS = [];   // 수집된 브랜드 목록 (빈 결과 안내용)
+let ACTIVE = null; // 마지막으로 포커스/추가된 카드 (검색 버튼 대상)
 
 const norm = s => String(s).replace(/\s+/g, "");
+const nz = s => String(s).toLowerCase().replace(/[\s()\[\]·,.\-+&_\/]/g, "");
 const fmt = v => (v === "" || v == null || isNaN(v)) ? "" : Number(v).toLocaleString();
 const digitsOf = s => parseInt(String(s).replace(/[^0-9]/g, ""), 10);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" })[c]);
 
 // 정산금액 = 판매가 − floor(판매가 × 수수료율)
 function settle(price, feePct) { return price - Math.floor(price * feePct / 100); }
@@ -70,33 +84,96 @@ function judge(be, lo, hi) {
   return ["중간: 판단 필요", "buy-mid"];
 }
 
-// ---- 상품명 매칭 (계획 문서 규칙 + 오탐 완화) ----
-// 1) 공백 제거 후 완전 일치 우선
-// 2) 구성품을 '+'로 나눠 정렬했을 때 같은 상품 (순서만 다른 같은 구성, 구성품은 정확히 일치)
-// 3) 아니면 입력을 '+'로 나눈 키워드가 모두 포함되고, 구성 개수('+' 개수 + 1)가 같은 상품
-// 후보가 여러 개면 판매대기 수량이 많은 상품을 먼저 쓴다.
-const keyOf = s => String(s).split("+").map(norm).filter(Boolean).sort().join("+");
-function buildIndex(items) {
-  return items.map(it => ({ it, norm: norm(it.n), plus: it.n.split("+").length, key: keyOf(it.n) }));
-}
-function findItem(q) {
-  const nq = norm(q);
-  if (!nq) return { item: null, cands: [] };
-  let cands = INDEX.filter(x => x.norm === nq);
-  if (!cands.length) cands = INDEX.filter(x => x.key === keyOf(q));
-  if (!cands.length) {
-    const kws = String(q).split("+").map(norm).filter(Boolean);
-    if (kws.length) cands = INDEX.filter(x => x.plus === kws.length && kws.every(k => x.norm.includes(k)));
+// ---- 금액 파싱: "1만5천원권" "5천5백원" "10000원" "1만" → 원 단위 ----
+function parseAmount(s) {
+  const t = norm(s);
+  let v = 0, hit = false;
+  const man = t.match(/(\d+)만/), cheon = t.match(/(\d+)천/), baek = t.match(/(\d+)백/);
+  if (man)   { v += +man[1] * 10000; hit = true; }
+  if (cheon) { v += +cheon[1] * 1000; hit = true; }
+  if (baek)  { v += +baek[1] * 100; hit = true; }
+  if (!hit) {
+    const d = t.match(/(\d{4,})원|^(\d{4,})$/);
+    if (d) { v = +(d[1] || d[2]); hit = true; }
   }
-  cands = cands.slice().sort((a, b) => b.it.c - a.it.c);
-  return { item: cands[0] ? cands[0].it : null, cands };
+  return hit ? v : 0;
+}
+// 금액 단위만 있는 토큰 ("만원", "만", "천원", "천")
+const unitOf = t => (t === "만원" || t === "만") ? "만" : ((t === "천원" || t === "천") ? "천" : "");
+
+// 상품명의 액면가 (금액권이 아니면 0). 이름에 '원'이 있을 때만 액면가로 본다.
+function faceValue(name) {
+  return /원/.test(norm(name)) ? parseAmount(name) : 0;
 }
 
-function suggest(q) {
+// ---- 상품명 매칭 ----
+// 1) 공백 제거 후 완전 일치 우선
+// 2) 구성품을 '+'로 나눠 정렬했을 때 같은 상품 (순서만 다른 같은 구성)
+// 3) 아니면 입력 키워드가 모두 포함되고 구성 개수가 같은 상품 (기존 규칙)
+// 4) 그래도 없으면 퍼지 검색: 토큰(공백·+로 나눔)을 모두 만족하는 상품
+//    토큰 = 브랜드명(부분 일치, 약칭 포함) | 금액(1만원·만원 등) | 상품명 일부
+const keyOf = s => String(s).split("+").map(norm).filter(Boolean).sort().join("+");
+const ALIAS = { "스벅": "스타벅스", "파바": "파리바게뜨", "배라": "배스킨라빈스", "커빈": "커피빈", "버킹": "버거킹", "투썸": "투썸플레이스", "뚜레": "뚜레쥬르" };
+
+function buildIndex(items) {
+  return items.map(it => ({
+    it,
+    norm: norm(it.n),
+    plus: it.n.split("+").length,
+    key: keyOf(it.n),
+    nameN: nz(it.n),
+    brandN: nz(it.b),
+    amt: faceValue(it.n),
+  }));
+}
+
+function splitQuery(q) { return String(q).split(/[\s+]+/).map(nz).filter(Boolean); }
+
+function matchTerm(x, tok) {
+  const unit = unitOf(tok);
+  if (unit) return x.amt > 0 && x.nameN.includes(unit);          // "만원": 만 단위 금액권 전체
+  if (/^\d/.test(tok)) {
+    const v = parseAmount(tok);
+    if (v) return x.amt === v;                                   // "1만원", "1만5천", "10000"
+  }
+  if (x.brandN.includes(tok)) return true;                       // 브랜드 일부 ("투썸", "뚜레")
+  if (ALIAS[tok] && x.brandN.includes(nz(ALIAS[tok]))) return true;
+  return x.nameN.includes(tok);                                  // 상품명 일부
+}
+
+// 정확 일치 단계 (기존 규칙). 판매대기 많은 순.
+function findExact(q) {
   const nq = norm(q);
-  if (nq.length < 2) return [];
-  return INDEX.filter(x => x.norm.includes(nq))
-    .sort((a, b) => b.it.c - a.it.c).slice(0, 15).map(x => x.it.n);
+  if (!nq) return [];
+  let c = INDEX.filter(x => x.norm === nq);
+  if (!c.length) c = INDEX.filter(x => x.key === keyOf(q));
+  if (!c.length) {
+    const kws = String(q).split("+").map(norm).filter(Boolean);
+    if (kws.length) c = INDEX.filter(x => x.plus === kws.length && kws.every(k => x.norm.includes(k)));
+  }
+  return c.slice().sort((a, b) => b.it.c - a.it.c);
+}
+
+// 퍼지 검색: 모든 토큰을 만족하는 상품. 판매대기 있는 것 먼저,
+// 금액 조건이면 액면가 오름차순, 아니면 판매대기 수량 내림차순.
+function searchItems(q) {
+  const toks = splitQuery(q);
+  if (!toks.length) return [];
+  const amtMode = toks.some(t => unitOf(t) || parseAmount(t) > 0);
+  const res = INDEX.filter(x => toks.every(t => matchTerm(x, t)));
+  res.sort((a, b) => ((b.it.c > 0) - (a.it.c > 0)) ||
+                     (amtMode ? a.amt - b.amt : b.it.c - a.it.c));
+  return res.map(x => x.it);
+}
+
+// 카드의 상품 결정: 후보를 직접 고른 경우 > 정확 일치 > 퍼지 검색 첫 결과
+function resolve(card) {
+  if (card.pickItem) return { item: card.pickItem, cands: [card.pickItem] };
+  const q = card.querySelector("input.nm").value;
+  const exact = findExact(q);
+  if (exact.length) return { item: exact[0].it, cands: exact.map(x => x.it) };
+  const fz = searchItems(q);
+  return { item: fz[0] || null, cands: fz };
 }
 
 function compute(item, buy) {
@@ -144,15 +221,47 @@ function bandSvg(c, sale) {
 
 function setDefaultSale(card) {
   const buy = digitsOf(card.querySelector("input.buy").value);
-  const { item } = findItem(card.querySelector("input.nm").value);
+  const { item } = resolve(card);
   card.querySelector("input.sale").value = (item && buy) ? fmt(breakEven(buy, item.fee)) : "";
+}
+
+// 검색 결과에서 고른 상품으로 카드 고정
+function pickItem(card, it) {
+  card.pickItem = it;
+  card.querySelector("input.nm").value = it.n;
+  card.querySelector(".cands").innerHTML = "";
+  if (card.dataset.saleTouched !== "1") setDefaultSale(card);
+  calcRow(card);
+}
+
+// 검색 버튼: 카드 상품명으로 후보 목록을 카드 안에 표시
+function doSearch(card) {
+  ACTIVE = card;
+  const box = card.querySelector(".cands");
+  const q = card.querySelector("input.nm").value;
+  if (!DATA) { box.innerHTML = `<div class="cand-empty">데이터 불러오는 중…</div>`; return; }
+  if (!norm(q)) { box.innerHTML = `<div class="cand-empty">상품명을 먼저 입력하세요 (예: 투썸 만원, 뚜레 2만원, 샐러드)</div>`; return; }
+  const all = searchItems(q);
+  if (!all.length) {
+    card._cands = [];
+    box.innerHTML = `<div class="cand-empty">일치하는 상품이 없습니다. 브랜드·금액·일부 단어만 넣어 보세요.<br>` +
+      `현재 수집 브랜드: ${esc(BRANDS.join(", "))} (여기 없는 브랜드는 수집 대상이 아님)</div>`;
+    return;
+  }
+  card._cands = all.slice(0, 30);
+  box.innerHTML = card._cands.map((it, i) =>
+      `<div class="cand" data-i="${i}"><b>${esc(it.n)}</b>` +
+      `<span>${esc(it.b)} · ${it.c > 0 ? `판매대기 ${it.c}개` : "판매대기 없음"} · 수수료 ${it.fee}%${it.fs === "d" ? "*" : ""}</span></div>`
+    ).join("") +
+    (all.length > 30 ? `<div class="cand-empty">${all.length}개 중 상위 30개만 표시 — 더 좁혀 보세요</div>` : "");
 }
 
 function addRow(name = "", buy = "") {
   const card = document.createElement("div");
   card.className = "card";
   card.innerHTML = `
-    <input type="text" class="nm" list="names" placeholder="상품명 (예: 패밀리 아이스크림)" value="${name}">
+    <input type="text" class="nm" placeholder="상품명 (예: 투썸 만원, 빕스 샐러드)" value="${esc(name)}">
+    <div class="cands"></div>
     <div class="pair">
       <div class="col">
         <input type="text" inputmode="numeric" class="buy" placeholder="구매가" value="${fmt(buy)}">
@@ -169,12 +278,25 @@ function addRow(name = "", buy = "") {
   const nm = card.querySelector("input.nm");
   const buyEl = card.querySelector("input.buy");
   const saleEl = card.querySelector("input.sale");
+  const candBox = card.querySelector(".cands");
   card.dataset.saleTouched = "0";
+  card.pickItem = null;
+  card._cands = [];
+  ACTIVE = card;
 
+  nm.addEventListener("focus", () => { ACTIVE = card; });
   nm.addEventListener("input", () => {
-    document.getElementById("names").innerHTML = suggest(nm.value).map(n => `<option value="${n.replace(/"/g, "&quot;")}">`).join("");
+    card.pickItem = null;          // 직접 수정하면 고정 선택 해제
+    candBox.innerHTML = "";
     if (card.dataset.saleTouched !== "1") setDefaultSale(card);
     calcRow(card);
+  });
+  nm.addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); doSearch(card); }
+  });
+  candBox.addEventListener("click", e => {
+    const el = e.target.closest(".cand");
+    if (el) pickItem(card, card._cands[+el.dataset.i]);
   });
   buyEl.addEventListener("input", () => {
     const d = digitsOf(buyEl.value);
@@ -195,22 +317,22 @@ function calcRow(card) {
   const q = card.querySelector("input.nm").value;
   const buy = digitsOf(card.querySelector("input.buy").value);
   const sale = digitsOf(card.querySelector("input.sale").value);
-  const { item, cands } = findItem(q);
   const beEl = card.querySelector(".be");
   const settleEl = card.querySelector(".settle");
   const band = card.querySelector(".band");
 
   if (!DATA) { band.textContent = "데이터 불러오는 중…"; return; }
   if (!norm(q)) { band.textContent = "-"; beEl.textContent = ""; settleEl.textContent = ""; return; }
+  const { item, cands } = resolve(card);
   if (!item) {
-    band.innerHTML = `<span class="verdict">상품을 찾을 수 없음</span><div class="meta">상품명을 확인하세요 (후보가 입력창 아래에 뜹니다)</div>`;
+    band.innerHTML = `<span class="verdict">상품을 찾을 수 없음</span><div class="meta">검색 버튼으로 후보를 찾아보세요. 수집 브랜드: ${esc(BRANDS.join(", "))}</div>`;
     beEl.textContent = ""; settleEl.textContent = ""; return;
   }
 
   const star = item.fs === "d" ? "*" : "";
   settleEl.textContent = (sale > 0) ? `판매 정산 ${fmt(settle(sale, item.fee))}${star}` : "";
 
-  const meta = `${item.b} · ${item.n !== q.trim() ? "→ " + item.n + " · " : ""}수수료 ${item.fee}%${star}` +
+  const meta = `${esc(item.b)} · ${item.n !== q.trim() ? "→ " + esc(item.n) + " · " : ""}수수료 ${item.fee}%${star}` +
                (cands.length > 1 ? ` · 후보 ${cands.length}개` : "");
   const c = compute(item, buy);
 
@@ -240,6 +362,9 @@ function runAll() { document.querySelectorAll("#rows .card").forEach(calcRow); }
 
 document.getElementById("addRow").addEventListener("click", () => addRow());
 document.getElementById("run").addEventListener("click", runAll);
+document.getElementById("search").addEventListener("click", () => {
+  doSearch(ACTIVE || document.querySelector("#rows .card"));
+});
 addRow();
 
 fetch("products.json?v=" + Date.now())
@@ -247,6 +372,7 @@ fetch("products.json?v=" + Date.now())
   .then(d => {
     DATA = d;
     INDEX = buildIndex(d.items);
+    BRANDS = [...new Set(d.items.map(i => i.b))];
     const m = d.meta;
     document.getElementById("status").textContent =
       `상품 ${d.items.length.toLocaleString()}개 · 데이터 생성 ${m.generated}` +
